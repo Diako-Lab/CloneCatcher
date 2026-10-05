@@ -1,0 +1,109 @@
+name: CloneCatcher-bulk
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # ===========================================
+  # Core Python
+  # ===========================================
+  - python>=3.9,<3.12
+  - pip
+  - setuptools<78
+
+  # ===========================================
+  # Pipeline Management
+  # ===========================================
+  - snakemake>=7.0
+  - mamba
+  - conda
+
+  # ===========================================
+  # CLI and Configuration
+  # ===========================================
+  - click>=8.0
+  - pyyaml
+  - rich  # For nice CLI output
+  - coincbc
+
+  # ===========================================
+  # Data Handling
+  # ===========================================
+  # Pinned to match ClusterCatcher so objects handed between the two
+  # pipelines read without a version shim
+  - pandas=2.2.3
+  - numpy=1.26.4
+  - scipy>=1.7
+  - h5py
+  - hdf5
+  - tqdm
+  - pyarrow
+
+  # ===========================================
+  # Bioinformatics Core Tools
+  # ===========================================
+  - samtools>=1.15
+  - pysam>=0.19
+  - perl>=5.32  # BuildImgtAnnot.pl
+  - zlib
+
+  # ===========================================
+  # Repertoire Reconstruction (TRUST4)
+  # ===========================================
+  # TRUST4 is vendored under external/ and built with make.
+  # Uncomment to use the bioconda build instead of the vendored one.
+  # - trust4>=1.0.13
+
+  # ===========================================
+  # Repertoire Statistics (Immunarch)
+  # ===========================================
+  - r-base>=4.2
+  - r-immunarch>=0.9
+  - r-dplyr
+  - r-ggplot2
+  - r-readr
+  - r-jsonlite
+  - rpy2>=3.4
+
+  # ===========================================
+  # Visualization
+  # ===========================================
+  - matplotlib-base>=3.5
+  - seaborn>=0.11
+  - adjusttext
+
+  # ===========================================
+  # Machine Learning / Statistics
+  # ===========================================
+  - scikit-learn>=1.0
+  - statsmodels  # Beta-binomial expansion test
+
+  # ===========================================
+  # Additional Utilities
+  # ===========================================
+  - biopython
+  - regex
+  - multiqc  # For QC reports
+
+  # ===========================================
+  # Pip Packages
+  # ===========================================
+  - pip:
+    - fishersapi
+
+# ===========================================
+# Notes
+# ===========================================
+# tcrdist3 is deliberately NOT in this environment. It does not support
+# pandas 2.x, and pandas is pinned to 2.2.3 here to match ClusterCatcher.
+# The specificity stage runs in envs/tcrdist3.yaml instead. This is the only
+# stage that crosses an environment boundary.
+#
+# External software NOT managed by conda (install separately):
+#
+# 1. TRUST4 (required for bulk mode)
+#    Vendored under external/TRUST4:
+#    cd external/TRUST4 && make
+#    Or clone from: https://github.com/liulab-dfci/TRUST4
+#
+# 2. IMGT reference (required for bulk mode)
+#    ./external/TRUST4/BuildImgtAnnot.pl Homo_sapiens > resources/IMGT+C.fa
