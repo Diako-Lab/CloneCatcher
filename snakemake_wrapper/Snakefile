@@ -1,704 +1,430 @@
+# =============================================================================
+# CloneCatcher
+#
+# T cell receptor repertoire reconstruction, clonal expansion testing, and
+# neoantigen specificity linkage from bulk or single-cell sequencing.
+#
+# Two frontends emit the same clonotype schema; one backend consumes it. The
+# mode is set by config["input_mode"] and decides which frontend enters the
+# DAG. Only one ever does.
+#
+# All output goes to config["output_dir"], a project-specific working directory
+# outside this repository.
+# =============================================================================
 
-# abort if no config is set
-if len(config) == 0:
+import pickle
+import sys
+from pathlib import Path
 
-    raise ValueError('config not set, make sure to run snakemake with config file')
-
-snakemake_dir = sys.path[0]
-conda_env_dir = snakemake_dir + '/envs'
-
-output_dir = config['output_dir']
-raw_dir = config['rawdir']
-aligner = config['aligner']
-alignment_dir = output_dir + '/alignment'
-log_dir = output_dir + '/logs'
-benchmark_dir = log_dir + '/benchmarks'
-methylation_dir = output_dir + '/methylation'
-qc_dir = output_dir + '/qc'
-mbias_dir = qc_dir + '/mbias'
-segmentation_dir = output_dir + '/segmentation'
-dmr_dir = output_dir + '/dmr'
-metilene_dir = dmr_dir + '/metilene'
-bsseq_dir = dmr_dir + '/bsseq'
-camel_dir = dmr_dir + '/camel'
-
-cgi_annotation_file = config['cgi_annotation_file']
-repeat_masker_annotation_file = config['repeat_masker_annotation_file']
-gene_annotation_file = config['gtf_annotation_file']
-ref_fasta = config['ref']
-
-num_threads = config['computing_threads']
-io_threads = config['io_threads']
-
-### WG-BLIMP v0.10.0 MODULAR ALIGNER
-
-### GEMBS
-if aligner == 'gembs':
-    target_files = [ output_dir + '/' + outfile for outfile in config['target_files']]
-    csv_reports = expand(alignment_dir + '/{sample}.csv', sample = config['samples'])
-    runtime_report = qc_dir + '/runtime.pdf'
-    gemBSconf = alignment_dir + '/gemBS.conf'
-    gemBSjson = alignment_dir + '/gemBS.json'
-    mbias_ob_reports = expand(mbias_dir + '/{sample}_OB.svg', sample = config['samples'])
-    mbias_ot_reports = expand(mbias_dir + '/{sample}_OT.svg', sample = config['samples'])
-    temp_dir = config['temp_dir']
-
-    rule all:
-        input:
-            target_files +
-            csv_reports +
-            [ runtime_report ] +
-            [ gemBSconf ] +
-            [ gemBSjson ] +
-            mbias_ob_reports +
-            mbias_ot_reports
-
-    ### ALIGNMENT
-
-    rule find_fqs:
-        output:
-            first  = output_dir +'/raw/{sample}.first.txt',
-            second = output_dir +'/raw/{sample}.second.txt'
-        params:
-            rawdir = config['rawdir'],
-            samples = config['samples'],
-            first_regex = config['rawsuffixregex']['first'],
-            second_regex = config['rawsuffixregex']['second'],
-            sample_fastq_csv = config['sample_fastq_csv']
-        log:
-            log_dir + '/find_fqs/{sample}.log'
-        priority: 10
-        conda:
-            conda_env_dir + '/r.yaml'
-        script:
-            'scripts/findFastqs.R'
-
-    rule prep_gemBS_files:
-        output:
-            csv = output_dir + '/alignment/gemBS.csv',
-            conf = output_dir + '/alignment/gemBS.conf'
-        priority: 9
-        shell:
-            """
-            touch {output.csv}
-            sed -i '1i"Barcode","Dataset","File1", "File2"' {output.csv}
-            cat << EOF > {output.conf}
-    reference = {ref_fasta}
-    index_dir = {raw_dir}
-    base = $HOME
-    sequence_dir = {raw_dir}
-    bam_dir = {alignment_dir}
-    bcf_dir = {alignment_dir}
-    extract_dir = {alignment_dir}
-    report_dir = {log_dir}
-    threads = {num_threads}
-    jobs = 4
-    include IHEC_standard.conf
-    EOF
-            """
-
-    rule gemBS_csv:
-        output:
-            metadata  = output_dir +'/alignment/{sample}.csv'
-        params:
-            outdir = config['output_dir'],
-            aligndir = alignment_dir,
-            rawdir = config['rawdir'],
-            samples = config['samples'],
-            first_regex = config['rawsuffixregex']['first'],
-            second_regex = config['rawsuffixregex']['second'],
-            sample_fastq_csv = config['sample_fastq_csv']
-        log:
-            log_dir + '/gemBS/{sample}.log'
-        priority: 8
-        conda:
-            conda_env_dir + '/r.yaml'
-        script:
-            'scripts/gemBS_csv.R'
-
-    rule clean_gemBS_csv:
-        input:
-            rules.prep_gemBS_files.output.csv
-        output:
-            csv = output_dir + '/alignment/gemBS_cleaned.csv'
-        priority: 7
-        shell:
-            """
-            sed 's/"//g' {input} > {output}
-            """
-
-    rule gemBS:
-        input:
-            rules.clean_gemBS_csv.output
-        output:
-            alignment_dir + '/gemBS.json'
-        log:
-            log_dir + '/gemBS/gemBS.log'
-        priority: 6
-        conda:
-            conda_env_dir + '/gemBS.yaml'
-        shell:
-            """
-            export alignDir={alignment_dir} 2> {log}
-            {snakemake_dir}/scripts/gemBS.sh 2> {log}
-            """
-
-    rule prep_fai:
-        output:
-            ref_fasta + '.gemBS.ref.fai'
-        priority: 5
-        shell:
-            """
-            mv {raw_dir}/*.fai {output}
-            """
-
-    rule mark_duplicates:
-        output:
-            bam = alignment_dir + '/{sample}.bam',
-            metrics = temp(alignment_dir + '/{sample}-dup-metrics.txt')
-        log:
-            log_dir + '/{sample}.mark_duplicates.log'
-        benchmark:
-            benchmark_dir + '/deduplication/{sample}.tsv'
-        params:
-            tmp_dir = temp_dir,
-            max_memory = config['java_memory_gb']
-        conda:
-            conda_env_dir + '/picard.yaml'
-        shell:
-            'picard -Xmx{params.max_memory}G MarkDuplicates -I {alignment_dir}/{wildcards.sample}.unmarked.bam -O {output.bam} -M {output.metrics} -TMP_DIR {params.tmp_dir} &> {log}'
-elif aligner == 'bwameth':
-    target_files = [ output_dir + '/' + outfile for outfile in config['target_files']]
-    runtime_report = qc_dir + '/runtime.pdf'
-    mbias_ob_reports = expand(mbias_dir + '/{sample}_OB.svg', sample = config['samples'])
-    mbias_ot_reports = expand(mbias_dir + '/{sample}_OT.svg', sample = config['samples'])
-
-    temp_dir = config['temp_dir']
-
-    rule all:
-        input:
-            target_files +
-            [ runtime_report ] +
-            mbias_ob_reports +
-            mbias_ot_reports
-
-    ### ALIGNMENT
-
-    rule find_fqs:
-        output:
-            first  = output_dir +'/raw/{sample}.first.txt',
-            second = output_dir +'/raw/{sample}.second.txt'
-        params:
-            rawdir = config['rawdir'],
-            samples = config['samples'],
-            first_regex = config['rawsuffixregex']['first'],
-            second_regex = config['rawsuffixregex']['second'],
-            sample_fastq_csv = config['sample_fastq_csv']
-        log:
-            log_dir + '/find_fqs/{sample}.log'
-        priority: 10
-        conda:
-            conda_env_dir + '/r.yaml'
-        script:
-            'scripts/findFastqs.R'
-
-    rule bwameth_indexing:
-        input:
-            ref = ref_fasta
-        output:
-            indices = [
-                ref_fasta + '.bwameth.c2t',
-                ref_fasta + '.bwameth.c2t.amb',
-                ref_fasta + '.bwameth.c2t.ann',
-                ref_fasta + '.bwameth.c2t.bwt',
-                ref_fasta + '.bwameth.c2t.pac',
-                ref_fasta + '.bwameth.c2t.sa',
-                ref_fasta + '.fai'
-            ]
-        log:
-            log_dir + '/bwameth_indexing.log'
-        conda:
-            conda_env_dir + '/bwameth.yaml'
-        shell:
-            """
-            bwameth.py index {input} 2> {log}
-            samtools faidx {input} 2> {log}
-            """
-
-    rule bwameth_align:
-        input:
-            ref = ref_fasta,
-            indices = [
-                ref_fasta + '.bwameth.c2t',
-                ref_fasta + '.bwameth.c2t.amb',
-                ref_fasta + '.bwameth.c2t.ann',
-                ref_fasta + '.bwameth.c2t.bwt',
-                ref_fasta + '.bwameth.c2t.pac',
-                ref_fasta + '.bwameth.c2t.sa',
-                ref_fasta + '.fai'
-            ],
-            first  = output_dir +'/raw/{sample}.first.txt',
-            second = output_dir +'/raw/{sample}.second.txt'
-        output:
-            temp(alignment_dir + '/{sample}.unsorted.bam')
-        log:
-            log_dir + '/{sample}.align.log'
-        threads:
-            num_threads
-        benchmark:
-            benchmark_dir + '/alignment/{sample}.tsv'
-        conda:
-            conda_env_dir + '/bwameth.yaml'
-        shell:
-            """
-            FQ1=$(cat {input.first} | tr '\n' ',')
-            FQ2=$(cat {input.second} | tr '\n' ',')
-            bwameth.py -t {threads} --reference {input.ref} $FQ1 $FQ2 2> {log} | samtools view -b - > {output} 2>/dev/null
-            """
-
-    rule sort_bam:
-        input:
-            rules.bwameth_align.output
-        output:
-            temp(alignment_dir + '/{sample}.sorted.bam')
-        log:
-            log_dir + '/{sample}.sorting.log'
-        threads:
-            num_threads
-        benchmark:
-            benchmark_dir + '/sorting/{sample}.tsv'
-        conda:
-            conda_env_dir + '/samtools.yaml'
-        shell:
-            'samtools sort -o {output} -@ {threads} {input} 2> {log}'
-
-    rule mark_duplicates:
-        input:
-            rules.sort_bam.output
-        output:
-            bam = alignment_dir + '/{sample}.bam',
-            metrics = temp(alignment_dir + '/{sample}-dup-metrics.txt')
-        log:
-            log_dir + '/{sample}.mark_duplicates.log'
-        benchmark:
-            benchmark_dir + '/deduplication/{sample}.tsv'
-        params:
-            tmp_dir = temp_dir,
-            max_memory = config['java_memory_gb']
-        conda:
-            conda_env_dir + '/picard.yaml'
-        shell:
-            'picard -Xmx{params.max_memory}G MarkDuplicates -I {input} -O {output.bam} -M {output.metrics} -TMP_DIR {params.tmp_dir} &> {log}'
+configfile: "config.yaml"
 
 
-rule index_bam:
+# --- paths -------------------------------------------------------------------
+
+OUT = Path(config["output_dir"])
+MODE = config["input_mode"]
+
+if MODE not in ("bulk", "single_cell"):
+    raise ValueError(
+        f"input_mode must be 'bulk' or 'single_cell', got {MODE!r}"
+    )
+
+# One environment per input type. Both carry the full stack for their mode.
+ENV = "envs/bulk.yaml" if MODE == "bulk" else "envs/scRNA.yaml"
+
+# One exception. tcrdist3 does not support pandas 2.x, and both environments
+# above pin pandas 2.2.3 to match ClusterCatcher's anndata 0.12.6. The
+# specificity stage therefore runs isolated, exchanging TSV with the rest of
+# the pipeline so the version skew stays contained.
+TCRDIST_ENV = "envs/tcrdist3.yaml"
+
+MODULES = config.get("modules", {})
+
+
+# --- sample resolution -------------------------------------------------------
+
+def declares_vdj(sample):
+    """True if a sample's cellranger multi config declares a VDJ library.
+
+    An upstream run may legitimately contain samples with no TCR library --
+    a series mixing 3' and 5' chemistry will, since 3' libraries cannot
+    produce VDJ data. Those samples are skipped rather than treated as a
+    failure.
+    """
+    cr = Path(config.get("cellranger_dir", ""))
+    candidates = [
+        cr / "multi_runs" / f"{sample}_multi_config.csv",
+        cr / "multi_runs" / sample / "outs" / "config.csv",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        in_block = False
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                in_block = line.lower().startswith("[libraries]")
+                continue
+            if not in_block or not line or line.startswith("fastq_id"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3 and "vdj" in parts[2].lower():
+                return True
+        return False
+    # No config found. Fall back to the published output path.
+    return (
+        cr / "multi_runs" / sample / "outs" / "per_sample_outs" / sample / "vdj_t"
+    ).is_dir()
+
+
+def resolve_samples():
+    """Sample IDs for this run.
+
+    bulk        -- from the sample pickle produced by `CloneCatcher
+                   sample-information`.
+    single_cell -- from the upstream ClusterCatcher AnnData, so the IDs match
+                   the barcode namespace rather than being re-derived from
+                   accessions or directory names, then filtered to those
+                   carrying a VDJ library.
+    """
+    if MODE == "bulk":
+        with open(config["sample_info"], "rb") as fh:
+            return sorted(pickle.load(fh).keys())
+
+    explicit = config.get("samples")
+    if explicit:
+        candidates = sorted(explicit)
+    else:
+        import anndata as ad
+        cc = Path(config["clustercatcher_run_dir"])
+        candidates = None
+        for rel in (
+            "signatures/adata_final.h5ad",
+            "adata_final.h5ad",
+            "dysregulation/adata_cancer_detected.h5ad",
+            "viral_integration/adata_viral_integrated.h5ad",
+            "annotation/adata_annotated.h5ad",
+        ):
+            path = cc / rel
+            if path.exists():
+                adata = ad.read_h5ad(path, backed="r")
+                candidates = sorted(adata.obs["sample_id"].astype(str).unique())
+                break
+        if candidates is None:
+            raise FileNotFoundError(
+                f"No ClusterCatcher AnnData under {cc}. Set `samples` in the "
+                "config to override, or point clustercatcher_run_dir at a "
+                "completed run."
+            )
+
+    kept = [s for s in candidates if declares_vdj(s)]
+    skipped = [s for s in candidates if s not in kept]
+
+    if skipped:
+        print(
+            f"CloneCatcher: skipping {len(skipped)} sample(s) with no VDJ "
+            f"library: {', '.join(skipped)}",
+            file=sys.stderr,
+        )
+    if not kept:
+        raise ValueError(
+            "No sample in this run declares a VDJ library. single_cell mode "
+            "needs cellranger multi output with a VDJ-T library. Check "
+            "cellranger_dir, or run `CloneCatcher inspect-barcodes` for a "
+            "per-sample report."
+        )
+    return kept
+
+
+SAMPLES = resolve_samples()
+
+
+# --- targets -----------------------------------------------------------------
+
+def target_files(wildcards=None):
+    """Final outputs for this run. Branches on mode so the unused frontend
+    never enters the DAG."""
+    targets = [
+        OUT / "tcr" / "clonotypes_by_sample.tsv",
+        OUT / "master_summary.yaml",
+    ]
+
+    if MODE == "single_cell":
+        targets += [
+            OUT / "tcr" / "clonotypes_by_cell.tsv",
+            OUT / "tcr" / "barcode_join_report.tsv",
+        ]
+
+    if MODULES.get("repertoire", True):
+        targets.append(OUT / "repertoire" / "repertoire_stats.tsv")
+    if MODULES.get("expansion", True):
+        targets.append(OUT / "expansion" / "expansion_results.tsv")
+    if MODULES.get("specificity", True):
+        targets.append(OUT / "specificity" / "specificity_clusters.tsv")
+    if MODE == "single_cell" and MODULES.get("integration", True):
+        targets.append(OUT / "integration" / "adata_tcr.h5ad")
+
+    return [str(t) for t in targets]
+
+
+rule all:
     input:
-        bam = alignment_dir + '/{sample}.bam'
+        target_files
+
+
+# =============================================================================
+# Module 1a -- TRUST4 reconstruction  (bulk)
+# =============================================================================
+
+rule trust4_reconstruct:
+    input:
+        sample_info=lambda w: config["sample_info"],
     output:
-        alignment_dir + '/{sample}.bai'
-    benchmark:
-        benchmark_dir + '/indexing/{sample}.tsv'
+        clonotypes=OUT / "tcr" / "trust4" / "{sample}" / "clonotypes.tsv",
+    params:
+        imgt=lambda w: config["trust4"]["imgt_reference"],
+        min_abundance=lambda w: config["trust4"].get("min_abundance", 2),
+        chains=lambda w: ",".join(config["trust4"].get("chains", ["TRA", "TRB"])),
+        outdir=lambda w: str(OUT / "tcr" / "trust4" / w.sample),
+    log:
+        OUT / "logs" / "tcr" / "trust4_{sample}.log",
+    threads: config.get("threads", 8)
     conda:
-        conda_env_dir + '/samtools.yaml'
-    shell:
-        'samtools index {input} {output}'
+        ENV
+    script:
+        "scripts/trust4_reconstruct.py"
 
 
-## QC
+# =============================================================================
+# Module 1b -- VDJ parse  (single_cell)
+# =============================================================================
+
+rule cellranger_vdj_parse:
+    output:
+        contigs=OUT / "tcr" / "vdj" / "{sample}" / "contigs.tsv",
+    params:
+        cellranger_dir=lambda w: config["cellranger_dir"],
+        sample=lambda w: w.sample,
+        require_productive=lambda w: config["vdj"].get("require_productive", True),
+        require_paired=lambda w: config["vdj"].get("require_paired", False),
+        min_umis=lambda w: config["vdj"].get("min_umis", 2),
+    log:
+        OUT / "logs" / "tcr" / "vdj_parse_{sample}.log",
+    conda:
+        ENV
+    script:
+        "scripts/cellranger_vdj_parse.py"
 
 
-rule fastqc:
-     input:
-         bam = alignment_dir + '/{sample}.bam'
-     output:
-         qc_dir + '/fastqc/{sample}_fastqc.html'
-     log:
-         log_dir + '/{sample}.fastqc.log'
-     benchmark:
-         benchmark_dir + '/fastqc/{sample}.tsv'
-     conda:
-         conda_env_dir + '/fastqc.yaml'
-     shell:
-         'fastqc -o $(dirname {output}) {input.bam} &> {log}'
+# =============================================================================
+# Module 2 -- Barcode namespace  (single_cell)
+#
+# Promotes bare CellRanger VDJ barcodes into ClusterCatcher's canonical
+# namespace and asserts the join rate. This rule raises on zero overlap rather
+# than writing an empty table.
+# =============================================================================
 
-rule picard_metrics:
-     input:
-         ref = ref_fasta,
-         bam = alignment_dir + '/{sample}.bam'
-     output:
-         alignment   = qc_dir +'/picard-metrics/{sample}-alignment.txt',
-         insert_size = qc_dir +'/picard-metrics/{sample}-insert-size.txt',
-         hist        = temp(qc_dir +'/picard-metrics/{sample}-hist.pdf')
-     log:
-         log_dir + '/{sample}.picard_metrics.log'
-     benchmark:
-         benchmark_dir + '/picard_metrics/{sample}.tsv'
-     params:
-         tmp_dir = temp_dir,
-         max_memory = config['java_memory_gb']
-     conda:
-         conda_env_dir + '/picard.yaml'
-     shell:
-         """
-         picard -Xmx{params.max_memory}G CollectAlignmentSummaryMetrics -R {input.ref} -I {input.bam} -O {output.alignment} -TMP_DIR {params.tmp_dir} &> {log}
-         picard -Xmx{params.max_memory}G CollectInsertSizeMetrics -I {input.bam} -O {output.insert_size} -H {output.hist} -TMP_DIR {params.tmp_dir} &> {log}
-         """
-
-rule qualimap:
-     input:
-         alignment_dir + '/{sample}.bam'
-     output:
-         qc_dir + '/qualimap/{sample}/qualimapReport.html'
-     threads:
-         io_threads
-     log:
-         log_dir + '/{sample}.qualimap.log'
-     benchmark:
-         benchmark_dir + '/qualimap/{sample}.tsv'
-     params:
-         memory = config['java_memory_gb']
-     conda:
-         conda_env_dir + '/qualimap.yaml'
-     shell:
-         'qualimap bamqc -bam {input} -outdir $(dirname {output}) -nt {threads} --collect-overlap-pairs --skip-duplicated --java-mem-size={params.memory}G &> {log} '
-
-if aligner == 'gembs':
-    rule mbias:
-         input:
-             fasta_ref = ref_fasta,
-             fasta_index = ref_fasta + '.gemBS.ref.fai',
-             bam_file = alignment_dir + '/{sample}.bam',
-             bam_index = alignment_dir + '/{sample}.bai'
-         log:
-             log_dir + '/{sample}_mbias.log'
-         benchmark:
-             benchmark_dir + '/{sample}_mbias.tsv'
-         output:
-             mbias_ot = mbias_dir + '/{sample}_OT.svg',
-             mbias_ob = mbias_dir + '/{sample}_OB.svg'
-         conda:
-             conda_env_dir + '/methyldackel.yaml'
-         shell:
-             'MethylDackel mbias {input.fasta_ref} {input.bam_file} {mbias_dir}/{wildcards.sample} &> {log}'
-elif aligner == 'bwameth':
-    rule mbias:
-         input:
-             fasta_ref = ref_fasta,
-             fasta_index = ref_fasta + '.fai',
-             bam_file = alignment_dir + '/{sample}.bam',
-             bam_index = alignment_dir + '/{sample}.bai'
-         log:
-             log_dir + '/{sample}_mbias.log'
-         benchmark:
-             benchmark_dir + '/{sample}_mbias.tsv'
-         output:
-             mbias_ot = mbias_dir + '/{sample}_OT.svg',
-             mbias_ob = mbias_dir + '/{sample}_OB.svg'
-         conda:
-             conda_env_dir + '/methyldackel.yaml'
-         shell:
-             'MethylDackel mbias {input.fasta_ref} {input.bam_file} {mbias_dir}/{wildcards.sample} &> {log}'
+rule barcode_namespace:
+    input:
+        contigs=expand(
+            str(OUT / "tcr" / "vdj" / "{sample}" / "contigs.tsv"),
+            sample=SAMPLES,
+        ),
+    output:
+        # Intermediate. Clonotype identity is assigned downstream in
+        # collapse_to_sample, which emits clonotypes_by_cell.tsv with IDs that
+        # join to clonotypes_by_sample.tsv.
+        cells=OUT / "tcr" / "cells_namespaced.tsv",
+        report=OUT / "tcr" / "barcode_join_report.tsv",
+    params:
+        clustercatcher_run_dir=lambda w: config["clustercatcher_run_dir"],
+        min_join_rate=lambda w: config["barcode"].get("min_join_rate", 0.40),
+        on_unmapped=lambda w: config["barcode"].get("on_unmapped", "drop"),
+        samples=SAMPLES,
+    log:
+        OUT / "logs" / "tcr" / "barcode_namespace.log",
+    conda:
+        ENV
+    script:
+        "scripts/barcode_namespace.py"
 
 
-rule multiqc:
-     input:
-         fastqc           = expand(qc_dir + '/fastqc/{sample}_fastqc.html', sample = config['samples']),
-         alnMetrics       = expand(qc_dir + '/picard-metrics/{sample}-alignment.txt', sample = config['samples']),
-         insertMetrics    = expand(qc_dir + '/picard-metrics/{sample}-insert-size.txt', sample = config['samples']),
-         qualimap         = expand(qc_dir + '/qualimap/{sample}/qualimapReport.html', sample = config['samples'])
-     output:
-         qc_dir + '/multiqc_report.html'
-     log:
-         log_dir + '/multiqc.log'
-     benchmark:
-         benchmark_dir + '/multiqc.tsv'
-     conda:
-         conda_env_dir + '/multiqc.yaml'
-     shell:
-         'multiqc -f -o {qc_dir} {qc_dir}/fastqc {qc_dir}/picard-metrics {qc_dir}/qualimap &> {log} '
+# =============================================================================
+# Shared schema -- clonotypes_by_sample.tsv
+#
+# Both frontends converge here. Everything downstream reads this file and
+# nothing else, which is what keeps the two modes from drifting apart.
+# =============================================================================
 
-rule methylation_metrics:
-     input:
-         bed_graphs = expand(methylation_dir + '/{sample}_CpG.bedGraph', sample = config['samples'])
-     output:
-         methylation_metrics = qc_dir + '/methylation_metrics.csv'
-     log:
-         log_dir + '/methylation_metrics.log'
-     params:
-         methylation_rate_on_chromosomes = config['methylation_rate_on_chromosomes']
-     benchmark:
-         benchmark_dir + '/methylation_metrics.tsv'
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/methylationMetrics.R'
+# Two definitions rather than one with conditional outputs, because the cell
+# table exists only in single_cell mode and Snakemake outputs are static per
+# rule. Only one is ever defined, since MODE is fixed for a run.
 
+if MODE == "single_cell":
 
-## DMR CALLING
+    rule collapse_to_sample:
+        input:
+            OUT / "tcr" / "cells_namespaced.tsv",
+        output:
+            by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+            by_cell=OUT / "tcr" / "clonotypes_by_cell.tsv",
+        params:
+            mode=MODE,
+            samples=SAMPLES,
+            sample_info=lambda w: config.get("sample_info"),
+            expansion_threshold=lambda w: config["expansion"].get(
+                "expansion_threshold", 0.01
+            ),
+        log:
+            OUT / "logs" / "tcr" / "collapse_to_sample.log",
+        conda:
+            ENV
+        script:
+            "scripts/collapse_to_sample.py"
 
+else:
 
-rule methyl_dackel:
-     input:
-         ref = ref_fasta,
-         bai = alignment_dir + '/{sample}.bai',
-         bam = alignment_dir + '/{sample}.bam'
-     output:
-         methylation_dir + '/{sample}_CpG.bedGraph'
-     params:
-         min_cov  = config['min_cov'],
-         methylation_dir = methylation_dir
-     benchmark:
-         benchmark_dir + '/methylation_calling/{sample}.tsv'
-     conda:
-         conda_env_dir + '/methyldackel.yaml'
-     shell:
-         'MethylDackel extract --mergeContext -o {params.methylation_dir}/{wildcards.sample} {input.ref} {input.bam}'
-
-rule bedgraph_to_methylation_ratio:
-     input:
-         bedGraph = methylation_dir + '/{sample}_CpG.bedGraph'
-     output:
-         bedGraph = temp(methylation_dir + '/{sample}_CpG_ratio.bedGraph')
-     log:
-         log_dir + '/{sample}.bedgraph_to_methylation_ratio.log'
-     benchmark:
-         benchmark_dir + '/metilene/{sample}.transformation.tsv'
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/transformBedGraph.R'
-
-rule metilene_input:
-     input:
-         expand(methylation_dir + '/{sample}_CpG_ratio.bedGraph', sample = config['group1']),
-         expand(methylation_dir + '/{sample}_CpG_ratio.bedGraph', sample = config['group2'])
-     output:
-         metilene_dir + '/metilene-input.bedGraph'
-     params:
-         g1_header = ' '.join([ 'g1_' + s for s in config['group1']]),
-         g2_header = ' '.join([ 'g2_' + s for s in config['group2']])
-     benchmark:
-         benchmark_dir + '/metilene/input.tsv'
-     conda:
-         conda_env_dir + '/metilene.yaml'
-     shell:
-         'bedtools unionbedg -filler NA -header -names {params.g1_header} {params.g2_header} -i {input} > {output}'
-
-rule metilene:
-     input:
-         metilene_dir + '/metilene-input.bedGraph'
-     output:
-         metilene_dir + '/dmrs.csv'
-     params:
-         min_cpg = config['min_cpg'],
-         min_diff = config['min_diff']
-     threads:
-         1
-     log:
-         log_dir + '/metilene.log'
-     benchmark:
-         benchmark_dir + '/metilene/calling.tsv'
-     conda:
-         conda_env_dir + '/metilene.yaml'
-     shell:
-         'metilene -m {params.min_cpg} -d {params.min_diff} -t {threads} {input} > {output} 2> {log}'
-
-rule camel_index:
-     input:
-         ref = ref_fasta,
-     output:
-         camel_h5 = ref_fasta + '.h5'
-     params:
-         snakemake_dir = snakemake_dir
-     shell:
-         'python {params.snakemake_dir}/submodules/camel/modules/index.py {input.ref} {output}'
-
-rule camel_call:
-     input:
-         index = ref_fasta + '.h5',
-         bam = alignment_dir + '/{sample}.bam',
-         bai = alignment_dir + '/{sample}.bai'
-     output:
-         camel_dir + '/{sample}.h5'
-     params:
-         snakemake_dir = snakemake_dir
-     log:
-         log_dir + '/{sample}.camel_call.log'
-     benchmark:
-         benchmark_dir + '/camel/{sample}.tsv'
-     shell:
-         'python {params.snakemake_dir}/submodules/camel/modules/call.py {input.bam} {input.index} {output} 2> {log}'
-
-rule camel_dmr:
-     input:
-         index   = ref_fasta + '.h5',
-         control = expand(camel_dir + '/{sample}.h5', sample = config['group1']),
-         case    = expand(camel_dir + '/{sample}.h5', sample = config['group2'])
-     output:
-         camel_dir + '/dmrs.csv'
-     params:
-         min_cpg  = config['min_cpg'],
-         min_diff = config['min_diff'],
-         min_cov  = config['min_cov'],
-         snakemake_dir = snakemake_dir
-     log:
-         log_dir + '/camel.log'
-     benchmark:
-         benchmark_dir + '/camel/dmr.tsv'
-     shell:
-         'python {params.snakemake_dir}/submodules/camel/modules/dmr.py {input.index} --case {input.case} --control {input.control} --min_diff {params.min_diff} --min_cpg {params.min_cpg} --min_cov {params.min_cov} > {output} 2> {log}'
-
-rule bsseq:
-     input:
-         meth = expand(methylation_dir + '/{sample}_CpG.bedGraph', sample = config['samples'])
-     output:
-         rdata = bsseq_dir + '/bsseq.Rdata',
-         csv   = bsseq_dir + '/dmrs.csv',
-         pdf   = bsseq_dir + '/top100.pdf'
-     threads:
-         config['io_threads']
-     params:
-         local_correct = config['bsseq_local_correct']
-     log:
-         log_dir + '/bsseq.log'
-     benchmark:
-         benchmark_dir + '/bsseq/bsseq.tsv'
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/bsseq.R'
+    rule collapse_to_sample:
+        input:
+            expand(
+                str(OUT / "tcr" / "trust4" / "{sample}" / "clonotypes.tsv"),
+                sample=SAMPLES,
+            ),
+        output:
+            by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+        params:
+            mode=MODE,
+            samples=SAMPLES,
+            sample_info=lambda w: config.get("sample_info"),
+            expansion_threshold=lambda w: config["expansion"].get(
+                "expansion_threshold", 0.01
+            ),
+        log:
+            OUT / "logs" / "tcr" / "collapse_to_sample.log",
+        conda:
+            ENV
+        script:
+            "scripts/collapse_to_sample.py"
 
 
-## DMR comparison
+# =============================================================================
+# Module 3 -- Repertoire statistics  (Immunarch)
+# =============================================================================
+
+rule repertoire_stats:
+    input:
+        by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+    output:
+        stats=OUT / "repertoire" / "repertoire_stats.tsv",
+        figdir=directory(OUT / "repertoire" / "figures"),
+    params:
+        diversity_methods=lambda w: config["repertoire"].get(
+            "diversity_methods", ["chao1", "shannon", "gini"]
+        ),
+        top_n_clones=lambda w: config["repertoire"].get("top_n_clones", 20),
+    log:
+        OUT / "logs" / "repertoire" / "repertoire_stats.log",
+    threads: config.get("threads", 8)
+    conda:
+        ENV
+    script:
+        "scripts/repertoire_stats.py"
 
 
-def expected_tool_files():
-     return {tool: dmr_dir + '/' + tool + '/dmrs.csv' for tool in config['dmr_tools']}
+# =============================================================================
+# Module 4 -- Expansion
+#
+# With expansion.contrast null, reports per-sample expanded-clone calls with no
+# hypothesis test. With a contrast declared, runs the beta-binomial differential
+# test between conditions within the blocking variable.
+# =============================================================================
 
-if aligner == 'gembs':
-    rule dmr_combination:
-         input:
-             **expected_tool_files(),
-             fasta_index = ref_fasta + '.gemBS.ref.fai'
-         output:
-             csv = dmr_dir + '/combined-dmrs.csv',
-             bed = dmr_dir + '/dmr-coverage/combined-dmrs.bed'
-         log:
-             log_dir + '/dmr_combination.log'
-         benchmark:
-             benchmark_dir + '/dmr_annotation/combination.tsv'
-         conda:
-             conda_env_dir + '/r.yaml'
-         script:
-             'scripts/dmrCombination.R'
-elif aligner == 'bwameth':
-    rule dmr_combination:
-         input:
-             **expected_tool_files(),
-             fasta_index = ref_fasta + '.fai'
-         output:
-             csv = dmr_dir + '/combined-dmrs.csv',
-             bed = dmr_dir + '/dmr-coverage/combined-dmrs.bed'
-         log:
-             log_dir + '/dmr_combination.log'
-         benchmark:
-             benchmark_dir + '/dmr_annotation/combination.tsv'
-         conda:
-             conda_env_dir + '/r.yaml'
-         script:
-             'scripts/dmrCombination.R'
+rule expansion_test:
+    input:
+        by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+    output:
+        results=OUT / "expansion" / "expansion_results.tsv",
+        figdir=directory(OUT / "expansion" / "figures"),
+    params:
+        contrast=lambda w: config["expansion"].get("contrast"),
+        fdr=lambda w: config["expansion"].get("fdr", 0.05),
+        expansion_threshold=lambda w: config["expansion"].get(
+            "expansion_threshold", 0.01
+        ),
+    log:
+        OUT / "logs" / "expansion" / "expansion_test.log",
+    conda:
+        ENV
+    script:
+        "scripts/expansion_test.py"
 
 
-rule dmr_coverage:
-     input:
-         bed = dmr_dir + '/dmr-coverage/combined-dmrs.bed',
-         bam = alignment_dir + '/{sample}.bam',
-         bai = alignment_dir + '/{sample}.bai'
-     output:
-         dmr_dir + '/dmr-coverage/{sample}.regions.bed.gz'
-     params:
-         min_mapq = config['annotation_min_mapq']
-     threads: config['computing_threads']
-     benchmark:
-         benchmark_dir + '/dmr_coverage/{sample}.tsv'
-     conda:
-         conda_env_dir + '/mosdepth.yaml'
-     shell:
-         'mosdepth --threads {threads} --no-per-base --mapq {params.min_mapq} --by {input.bed} $(dirname {output})/{wildcards.sample} {input.bam}'
+# =============================================================================
+# Module 5 -- Specificity  (tcrdist3)
+# =============================================================================
 
-rule dmr_annotation:
-     input:
-         coverages = expand(dmr_dir + '/dmr-coverage/{sample}.regions.bed.gz', sample = config['samples']),
-         combined_dmrs = dmr_dir + '/combined-dmrs.csv'
-     output:
-         annotated_dmrs = dmr_dir + '/annotated-dmrs.csv'
-     params:
-         biotypes = config['annotation_allowed_biotypes'],
-         tss_distances = config['promoter_tss_distances'],
-         cgi_annotation_file = cgi_annotation_file,
-         gene_annotation_file = gene_annotation_file,
-         repeat_masker_annotation_file = repeat_masker_annotation_file
-     log:
-         log_dir + '/dmr_annotation.log'
-     benchmark:
-         benchmark_dir + '/dmr_annotation/annotation.tsv'
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/dmrAnnotation.R'
+rule tcrdist_cluster:
+    input:
+        by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+    output:
+        clusters=OUT / "specificity" / "specificity_clusters.tsv",
+        hits=OUT / "specificity" / "database_hits.tsv",
+        figdir=directory(OUT / "specificity" / "figures"),
+    params:
+        method=lambda w: config["specificity"].get("method", "tcrdist3"),
+        radius=lambda w: config["specificity"].get("radius", 50),
+        reference_dbs=lambda w: config["specificity"].get(
+            "reference_dbs", ["vdjdb", "mcpas"]
+        ),
+        resources_dir=lambda w: config.get("resources_dir", "resources"),
+    log:
+        OUT / "logs" / "specificity" / "tcrdist_cluster.log",
+    threads: config.get("threads", 8)
+    conda:
+        TCRDIST_ENV
+    script:
+        "scripts/tcrdist_cluster.py"
 
 
-## SEGMENTATION
+# =============================================================================
+# Module 6 -- ClusterCatcher integration  (single_cell)
+# =============================================================================
+
+rule join_clustercatcher:
+    input:
+        by_cell=OUT / "tcr" / "clonotypes_by_cell.tsv",
+        by_sample=OUT / "tcr" / "clonotypes_by_sample.tsv",
+    output:
+        adata=OUT / "integration" / "adata_tcr.h5ad",
+    params:
+        clustercatcher_run_dir=lambda w: config["clustercatcher_run_dir"],
+        min_join_rate=lambda w: config["barcode"].get("min_join_rate", 0.40),
+    log:
+        OUT / "logs" / "integration" / "join_clustercatcher.log",
+    conda:
+        ENV
+    script:
+        "scripts/join_clustercatcher.py"
 
 
-rule methylseekr:
-     input:
-         ref = ref_fasta,
-         methylation_table = expand(methylation_dir + '/{sample}_CpG.bedGraph', sample = config['samples'])
-     output:
-         pmd_all = segmentation_dir + '/pmd-all.csv',
-         umr_lmr_all = segmentation_dir + '/umr-lmr-all.csv',
-         pmd_segments = expand(segmentation_dir + '/{sample}/pmd-segments.csv', sample = config['samples']),
-         umr_lmr_with_pmd = expand(segmentation_dir + '/{sample}/LMRUMRwithPMD/umr-lmr.csv', sample = config['samples']),
-         umr_lmr_without_pmd = expand(segmentation_dir + '/{sample}/LMRUMRwithoutPMD/umr-lmr.csv', sample = config['samples'])
-     params:
-         target_dir = segmentation_dir,
-         samples = config['samples'],
-         methylation_dir = methylation_dir,
-         calibration_chr = config['methylseekr_pmd_chromosome'],
-         biotypes = config['annotation_allowed_biotypes'],
-         tss_distances = config['promoter_tss_distances'],
-         min_coverage = config['min_cov'],
-         methylation_cutoff = config['methylseekr_methylation_cutoff'],
-         fdr_cutoff = config['methylseekr_fdr_cutoff'],
-         cgi_annotation_file = cgi_annotation_file,
-         gene_annotation_file = gene_annotation_file,
-         repeat_masker_annotation_file = repeat_masker_annotation_file
-     log:
-         log_dir + '/methylseekr.log'
-     benchmark:
-         benchmark_dir + '/methylseekr.tsv'
-     threads:
-         num_threads
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/methylseekRSegmentation.R'
+# =============================================================================
+# Module 7 -- Summary
+# =============================================================================
 
+rule generate_summary:
+    input:
+        target_files_except_summary=lambda w: [
+            t for t in target_files() if not t.endswith("master_summary.yaml")
+        ],
+    output:
+        summary=OUT / "master_summary.yaml",
+    params:
+        mode=MODE,
+        samples=SAMPLES,
+    log:
+        OUT / "logs" / "generate_summary.log",
+    conda:
+        ENV
+    script:
+        "scripts/generate_summary.py"
 
-## BENCHMARKING
-
-
-rule benchmark_plot:
-     input:
-         target_files = target_files
-     output:
-         runtime_report = runtime_report
-     params:
-         benchmark_dir = benchmark_dir
-     log:
-         log_dir + '/benchmark.log'
-     conda:
-         conda_env_dir + '/r.yaml'
-     script:
-         'scripts/benchmarkPlot.R'
